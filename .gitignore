@@ -24,3 +24,6 @@ lm/
 
 # arch.json and vocab.json ARE committed on purpose (a few hundred bytes each,
 # and every Kaggle session then starts straight at training).
+
+# the dataset-route zip
+*.zip
