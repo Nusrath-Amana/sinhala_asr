@@ -50,11 +50,40 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=200)
     ap.add_argument("--cache-dir", default=None, help="where to put the downloaded source file")
     ap.add_argument("--no-keep-download", action="store_true")
+    ap.add_argument("--push-to", default=None,
+                    help="an HF dataset repo id. Each shard is uploaded as soon as it is written "
+                         "and then deleted locally, so peak DISK stays at one shard instead of a "
+                         "second copy of the split. Afterwards train.py --repo <that id> streams "
+                         "it, because the shards have 200-row row groups.")
+    ap.add_argument("--force", action="store_true", help="skip the RAM check")
     a = ap.parse_args()
 
     import pyarrow as pa
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
+
+    # A single row group may have to be materialised whole, so check the RAM before the download
+    # rather than letting Kaggle kill the session 14 GB later.
+    need = {"train": 14.11e9, "validation": 1.46e9, "test": 1.63e9}[a.split]
+    avail = None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        pass
+    if avail is not None:
+        print(f"RAM available {human(avail)}; {a.split} needs up to ~{human(need * 1.6)}")
+        if avail < need * 1.6 and not a.force:
+            raise SystemExit(
+                f"\nNot enough RAM for '{a.split}'. Its audio column is one row group that may "
+                f"have to be read whole.\n"
+                f"  - Set the notebook Accelerator to NONE: a Kaggle CPU session has ~30 GB, a GPU "
+                f"session far less.\n"
+                f"  - Or reshard '--split validation' (1.46 GB) first and train on that end to end.\n"
+                f"  - --force overrides this check.")
 
     os.makedirs(a.out, exist_ok=True)
     print(f"downloading {a.split}.parquet from {a.repo} ...", flush=True)
@@ -73,12 +102,33 @@ def main() -> None:
     shard = rows_in_shard = seen = 0
     t0 = time.time()
 
+    api = None
+    if a.push_to:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(a.push_to, repo_type="dataset", exist_ok=True)
+        print(f"  uploading each shard to {a.push_to} as it is written", flush=True)
+    current: list[str] = []
+
+    def finish_shard():
+        """Close the open shard and, with --push-to, upload then delete it so disk stays flat."""
+        nonlocal writer
+        if writer is None:
+            return
+        writer.close()
+        writer = None
+        if api and current:
+            path = current[-1]
+            api.upload_file(path_or_fileobj=path, path_in_repo=f"data/{os.path.basename(path)}",
+                            repo_id=a.push_to, repo_type="dataset")
+            os.remove(path)
+
     def open_shard(schema):
         nonlocal writer, shard, rows_in_shard
-        if writer is not None:
-            writer.close()
+        finish_shard()
         path = os.path.join(a.out, f"{a.split}-{shard:04d}.parquet")
         writer = pq.ParquetWriter(path, schema, compression="zstd")
+        current.append(path)
         shard += 1
         rows_in_shard = 0
         return path

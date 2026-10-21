@@ -135,7 +135,7 @@ def quick_wer(tower, head, arch, vocab, args, device, amp_dtype, feats, n: int =
     tower.eval()
     head.eval()
     refs, hyps = [], []
-    for b in D.batches(args.repo, "validation", arch, vocab, batch_size=args.batch_size,
+    for b in D.batches(args.repo, args.val_split, arch, vocab, batch_size=args.batch_size,
                        max_seconds=args.max_seconds, bucket=args.bucket, lang=args.lang,
                        features=feats, streaming=True, seed=0):
         logits, enc_lens = fwd(tower, head, b, arch, device, amp_dtype)
@@ -156,7 +156,12 @@ def quick_wer(tower, head, arch, vocab, args, device, amp_dtype, feats, n: int =
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="SinhaSpeech/sinhala-asr-data-v7")
+    ap.add_argument("--repo", default="SinhaSpeech/sinhala-asr-data-v7",
+                    help="a Hub id, or a directory of reshard.py output")
+    ap.add_argument("--train-split", default="train")
+    ap.add_argument("--val-split", default="validation",
+                    help="set both to 'validation' for a first end-to-end run: it is 1.46 GB, so "
+                         "it reshards in minutes, where train is 14.1 GB")
     ap.add_argument("--arch", default="arch.json")
     ap.add_argument("--vocab", default="vocab.json")
     ap.add_argument("--lang", default=None,
@@ -248,7 +253,7 @@ def main() -> None:
     head.train()
     run, nrun, micro, dropped = 0.0, 0, 0, 0
     print("step      loss      lr        rows/s   dropped")
-    for b in D.batches(args.repo, "train", arch, vocab, batch_size=args.batch_size,
+    for b in D.batches(args.repo, args.train_split, arch, vocab, batch_size=args.batch_size,
                        max_seconds=args.max_seconds, bucket=args.bucket, lang=args.lang,
                        features=feats, streaming=True, epochs=100):
         on_dev = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
