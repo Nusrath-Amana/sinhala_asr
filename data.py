@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import unicodedata
 
 import numpy as np
@@ -112,8 +113,61 @@ def decode_wav(b: bytes, sr: int = 16000) -> np.ndarray | None:
     return x
 
 
+COLS = ["audio", "text", "source_dataset", "language"]
+
+
+def shard_paths(root: str, split: str) -> list[str]:
+    import glob
+    pats = (os.path.join(root, f"{split}-*.parquet"),
+            os.path.join(root, split, "*.parquet"),
+            os.path.join(root, f"{split}.parquet"))
+    out: list[str] = []
+    for p in pats:
+        out.extend(sorted(glob.glob(p)))
+    return out
+
+
+def local_rows(root: str, split: str, lang: str | None, shuffle_buffer: int, seed: int):
+    """Stream reshard.py's output. Shard order is shuffled, then rows within a buffer -- which is
+    as much randomness as this needs and costs no extra memory."""
+    import random
+
+    import pyarrow.parquet as pq
+    paths = shard_paths(root, split)
+    if not paths:
+        raise FileNotFoundError(
+            f"no parquet for split '{split}' under {root}. Expected {split}-0000.parquet files "
+            f"from reshard.py. Run: python reshard.py --split {split} --out {root}")
+    rng = random.Random(seed)
+    rng.shuffle(paths)
+    buf: list[dict] = []
+    for path in paths:
+        pf = pq.ParquetFile(path, memory_map=True, pre_buffer=False)
+        for batch in pf.iter_batches(batch_size=64, columns=COLS):
+            d = batch.to_pydict()
+            for i in range(batch.num_rows):
+                if lang and d["language"][i] != lang:
+                    continue
+                buf.append({k: d[k][i] for k in COLS})
+            if shuffle_buffer and len(buf) >= shuffle_buffer:
+                rng.shuffle(buf)
+                yield from buf
+                buf = []
+    if buf:
+        rng.shuffle(buf)
+        yield from buf
+
+
 def rows(repo: str, split: str, *, streaming: bool = True, lang: str | None = None,
          shuffle_buffer: int = 2000, seed: int = 42):
+    """Local reshard.py output if `repo` is a directory, else the Hub.
+
+    NOTE on the Hub path: every split of stratified_v7 is a SINGLE parquet row group (train is
+    14.6 GB of it), and a row group is what a reader materialises -- so `datasets` streaming will
+    try to load the whole thing and be OOM-killed. Reshard first; see reshard.py."""
+    if os.path.isdir(repo):
+        yield from local_rows(repo, split, lang, shuffle_buffer, seed)
+        return
     from datasets import load_dataset
     ds = load_dataset(repo, split=split, streaming=streaming)
     if streaming and shuffle_buffer:

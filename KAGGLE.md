@@ -151,10 +151,24 @@ bytes and it saves ever running notebook A again.
 Kaggle's own OOM killer, not a code crash. Two causes, both fixed in the current scripts -- run
 `git pull` first -- and two escape hatches:
 
-| script | why it ballooned | fix |
-|---|---|---|
-| `vocab.py` | read the `audio` column (megabytes a row) just to count characters | two passes: text via `select_columns`, durations over `--rate-sample 1500` only |
-| `probe.py` | loaded the whole 744M model in fp32 (~3 GB, plus a copy) to reach the 305M tower | `--dtype bfloat16` is now the default, and the rest of the model is freed before the forward |
+**The root cause is the dataset's parquet layout**, measured from its footers:
+
+| split | size | rows | row groups | audio column |
+|---|---|---|---|---|
+| train | 14.11 GB | 108,278 | **1** | 14.1 GB |
+| validation | 1.46 GB | 14,084 | **1** | 1.46 GB |
+| test | 1.63 GB | 15,860 | **1** | 1.63 GB |
+
+A row group is the unit a parquet reader materialises, and there is no way to slice one. So
+`load_dataset(streaming=True)` on `train` tries to pull 14 GB before yielding a single row -- which
+is also why HF's own viewer says "Scan size limit exceeded" on this repo. `select_columns` does not
+save you, because it filters after the row is read.
+
+| script | fix |
+|---|---|
+| `vocab.py` | dropped `datasets` for pyarrow: pass 1 fetches **only the text column** (5.3 MB of the 14.6 GB, ~4 s for all 108,278 rows); pass 2 takes durations from `validation` (1.46 GB), never `train` |
+| `probe.py` | `--dtype bfloat16` by default, the rest of the 744M model freed before the forward, and `--no-weights` to skip the download entirely |
+| `train.py` | needs the audio, so it cannot prune. **Reshard once** -- see below |
 
 If it still dies:
 
@@ -167,10 +181,29 @@ If it still dies:
 encoder width, frame rate, stride, parameter count -- comes from the shapes, so random weights
 give an identical `arch.json`.
 
+### Resharding (required before training)
+
+`train.py` needs the audio column, so column pruning cannot help it. Rewrite the split once with
+sane row groups and stream from the shards afterwards. **CPU session** -- a GPU session has too
+little RAM for the 14 GB split:
+
+```python
+!python reshard.py --split validation --out /kaggle/temp/v7     # 1.5 GB, prove it works
+!python reshard.py --split train      --out /kaggle/temp/v7     # 14 GB, ~30 GB disk needed
+```
+
+Then publish `/kaggle/temp/v7` as a Kaggle Dataset (so you never redo it) and point training at it:
+
+```python
+!python train.py --repo /kaggle/input/v7-shards --freeze-encoder --max-steps 200 --subset 500
+```
+
+`train.py --repo` takes either a directory of shards or a Hub id; `data.py` detects which.
+
 Check what you actually have before guessing:
 
 ```python
-!free -g; nproc
+!free -g; nproc; df -h /kaggle/temp /kaggle/working
 ```
 
 A CPU session has far more RAM than a GPU one, which is the other reason to keep notebook A on CPU.

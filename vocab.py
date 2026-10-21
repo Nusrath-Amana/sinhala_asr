@@ -6,13 +6,19 @@ graphemes per second than that can never be learned -- the loss goes to inf, zer
 it, and WER plateaus looking exactly like a bad learning rate. --report prints that headroom
 against arch.json before you spend a Kaggle hour on it.
 
-MEMORY. Two passes on purpose, because the `audio` column is megabytes per row and pulling it to
-count characters is what OOMs a Kaggle session:
+MEMORY -- WHY THIS DOES NOT USE `datasets`. Every split of this dataset is ONE parquet row group:
+train is 108,278 rows in a single 14.6 GB group, of which `audio` is 14.1 GB and `text` just 5.3 MB.
+A row group is the unit a parquet reader materialises, so `load_dataset(streaming=True)` tries to
+pull all 14 GB and Kaggle kills the session before the first row arrives. It is also why the HF
+dataset viewer reports "Scan size limit exceeded" on this repo.
 
-  pass 1  text only, via select_columns -- the audio bytes are never read at all. Cheap over
-          every row, so --limit defaults to the whole split.
-  pass 2  only with --report, and only over --rate-sample rows (default 1500), because durations
-          need the audio. A sample is plenty to find the p95 grapheme rate.
+pyarrow can prune to the columns it needs, which is the whole fix:
+
+  pass 1  `text` only, read straight from the Hub with range requests -- 108,278 rows in ~4 s and
+          ~12 MB, because the audio pages are never fetched. --limit defaults to every row.
+  pass 2  only with --report. Durations need the audio, and no reader can take a slice of a single
+          14 GB group, so this uses the `validation` split instead (1.46 GB, same sources, so the
+          same grapheme-rate distribution) and caps rows at --rate-sample.
 
     python vocab.py --report
 """
@@ -49,21 +55,32 @@ def script_of(ch: str) -> str:
     return "other"
 
 
+def open_split(repo: str, split: str):
+    """A ParquetFile over the Hub, read by range request. Nothing is downloaded until a column
+    is actually asked for."""
+    from huggingface_hub import HfFileSystem
+    import pyarrow.parquet as pq
+    fs = HfFileSystem()
+    return pq.ParquetFile(fs.open(f"datasets/{repo}/{split}.parquet", "rb"))
+
+
 def text_pass(repo: str, split: str, limit: int):
-    """Vocabulary and script statistics, without ever touching the audio column."""
-    from datasets import load_dataset
-    ds = load_dataset(repo, split=split, streaming=True)
-    try:
-        ds = ds.select_columns(TEXT_COLS)
-    except Exception as e:  # noqa: BLE001 - older datasets, or a column renamed upstream
-        print(f"  (select_columns unavailable: {e} -- falling back, this will use more memory)")
+    """Vocabulary and script statistics. Reads the text column and nothing else."""
+    import time
+    t0 = time.time()
+    pf = open_split(repo, split)
+    print(f"  {pf.metadata.num_rows:,} rows in the file; fetching the text column only", flush=True)
+    table = pf.read(columns=TEXT_COLS)
+    print(f"  text column in {time.time()-t0:.1f}s ({table.nbytes/1e6:.1f} MB)", flush=True)
+    ds = ({"text": t, "language": l, "source_dataset": sd} for t, l, sd in zip(
+        table.column("text").to_pylist(),
+        table.column("language").to_pylist(),
+        table.column("source_dataset").to_pylist()))
     counts: collections.Counter = collections.Counter()
     scripts: collections.Counter = collections.Counter()
     langs: collections.Counter = collections.Counter()
     sources: collections.Counter = collections.Counter()
     mixed = n = 0
-    import time
-    t0 = time.time()
     for row in ds:
         t = norm(row["text"])
         counts.update(t)
@@ -79,40 +96,41 @@ def text_pass(repo: str, split: str, limit: int):
             break
         # An early heartbeat, then regular ones: the first parquet row group takes a while to
         # open and a silent terminal is indistinguishable from a hung stream.
-        if n in (1, 500) or n % 5000 == 0:
-            el = time.time() - t0
-            print(f"  {n:,} rows  {el:.0f}s  {n/max(el,1e-9):.0f} rows/s", flush=True)
-    print(f"  done: {n:,} rows in {time.time()-t0:.0f}s", flush=True)
+        if n % 25000 == 0:
+            print(f"  counted {n:,}", flush=True)
+    print(f"  done: {n:,} rows in {time.time()-t0:.1f}s total", flush=True)
     return counts, scripts, langs, sources, mixed, n
 
 
 def rate_pass(repo: str, split: str, sample: int):
-    """Grapheme rate, over a bounded sample. Only the header of each clip is parsed -- sf.info
-    reads the WAV header, not the samples -- and nothing is retained but the rates."""
+    """Grapheme rate. Reads the audio column of ONE split into memory -- so this runs on
+    `validation` (1.46 GB), never `train` (14.1 GB). Only WAV headers are parsed, not samples."""
+    import time
     import soundfile as sf
-    from datasets import load_dataset
-    ds = load_dataset(repo, split=split, streaming=True)
+    t0 = time.time()
+    pf = open_split(repo, split)
+    print(f"  reading {split} audio+text ({pf.metadata.num_rows:,} rows, ~1.5 GB)...", flush=True)
+    table = pf.read(columns=["audio", "text"])
+    print(f"  in memory after {time.time()-t0:.0f}s", flush=True)
+    audio, texts = table.column("audio"), table.column("text")
     rates: list[float] = []
     worst: list[tuple[float, str]] = []
-    n = 0
-    for row in ds:
-        t = norm(row["text"])
-        try:
-            info = sf.info(io.BytesIO(row["audio"]))
-            secs = info.frames / info.samplerate
-        except Exception:  # noqa: BLE001 - a bad row must not stop the scan
+    for i in range(min(len(texts), sample)):
+        t = norm(texts[i].as_py())
+        b = audio[i].as_py()
+        if not t or not b:
             continue
-        finally:
-            row = None
-        if secs > 0.2 and t:
+        try:
+            info = sf.info(io.BytesIO(b))
+            secs = info.frames / info.samplerate
+        except Exception:  # noqa: BLE001 - 16 kHz PCM16 fallback if the header will not parse
+            secs = max(0.0, (len(b) - 44) / 32000)
+        if secs > 0.2:
             r = len(t) / secs
             rates.append(r)
             worst.append((r, t[:40]))
             worst.sort(key=lambda x: -x[0])
-            del worst[3:]          # keep three, not twenty thousand
-        n += 1
-        if n >= sample:
-            break
+            del worst[3:]
     return rates, worst
 
 
@@ -121,7 +139,10 @@ def main() -> None:
     ap.add_argument("--repo", default="SinhaSpeech/sinhala-asr-data-v7")
     ap.add_argument("--split", default="train")
     ap.add_argument("--limit", type=int, default=0, help="0 = every row (text pass is cheap)")
-    ap.add_argument("--rate-sample", type=int, default=1500, help="rows read WITH audio for --report")
+    ap.add_argument("--rate-sample", type=int, default=4000, help="rows scored for --report")
+    ap.add_argument("--rate-split", default="validation",
+                    help="split used for durations: validation (1.46 GB) or test (1.63 GB). "
+                         "NEVER train -- its single row group is 14.1 GB of audio.")
     ap.add_argument("--min-count", type=int, default=5, help="chars rarer than this become <unk>")
     ap.add_argument("--arch", default="arch.json")
     ap.add_argument("--out", default="vocab.json")
