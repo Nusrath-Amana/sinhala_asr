@@ -1,0 +1,26 @@
+# Checkpoints live on the Hub (--hub-repo), never in git: each is ~1.2 GB.
+ckpt/
+*.pt
+*.safetensors
+
+# Run outputs
+eval.json
+result.json
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# REAL MANAGER AUDIO NEVER LEAVES YOUR MACHINE. Consented recordings and their
+# transcripts stay local: pass them to evaluate.py --audio-dir by path.
+holdout/
+*.wav
+*.m4a
+*.flac
+
+# The 4-gram is large and rebuildable from its corpus
+lm/
+*.arpa
+*.bin
+
+# arch.json and vocab.json ARE committed on purpose (a few hundred bytes each,
+# and every Kaggle session then starts straight at training).

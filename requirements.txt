@@ -1,0 +1,11 @@
+# Pinned loosely: Kaggle images move. transformers must be new enough for embedding_gemma2.
+transformers>=4.57
+torch>=2.4
+datasets>=3.0
+soundfile>=0.12
+numpy>=1.26
+jiwer>=3.0
+huggingface_hub>=0.26
+# Decoding with the 4-gram (step 3, not needed to train):
+# pyctcdecode>=0.5.0
+# kenlm @ https://github.com/kpu/kenlm/archive/master.zip
