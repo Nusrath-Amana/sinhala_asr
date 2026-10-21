@@ -106,19 +106,27 @@ def encode(tower, batch, arch, device, amp_dtype):
             r = tower(**{arch.feat_key: x, arch.mask_key: m})
         else:
             r = tower(x)
-        return r[0] if isinstance(r, tuple) else getattr(r, "last_hidden_state", r)
+    hidden = r[0] if isinstance(r, tuple) else getattr(r, "last_hidden_state", r)
+    # The tower hands back its own downsampled frame mask (True = valid). Prefer it over
+    # feature_len / stride, which drifts by a frame once a batch is padded.
+    enc_mask = None if isinstance(r, tuple) else getattr(r, "attention_mask", None)
+    return hidden, enc_mask
 
 
 def fwd(tower, head, batch, arch, device, amp_dtype):
-    enc = encode(tower, batch, arch, device, amp_dtype)
-    return head(enc.float())  # head and loss stay in fp32
+    enc, enc_mask = encode(tower, batch, arch, device, amp_dtype)
+    logits = head(enc.float())  # head and loss stay in fp32
+    if enc_mask is not None and enc_mask.ndim == 2:
+        lens = enc_mask.sum(-1).long()
+    else:
+        lens = batch["enc_lens"].to(logits.device)
+    return logits, lens.clamp(max=logits.shape[1])
 
 
-def ctc_loss(logits, batch, blank: int):
+def ctc_loss(logits, enc_lens, batch, blank: int):
     logp = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T, B, V), fp32
-    enc_lens = batch["enc_lens"].clamp(max=logp.shape[0])
-    return F.ctc_loss(logp, batch["targets"], enc_lens, batch["target_lens"],
-                      blank=blank, reduction="mean", zero_infinity=True)
+    return F.ctc_loss(logp, batch["targets"], enc_lens.clamp(max=logp.shape[0]),
+                      batch["target_lens"], blank=blank, reduction="mean", zero_infinity=True)
 
 
 @torch.no_grad()
@@ -130,8 +138,9 @@ def quick_wer(tower, head, arch, vocab, args, device, amp_dtype, feats, n: int =
     for b in D.batches(args.repo, "validation", arch, vocab, batch_size=args.batch_size,
                        max_seconds=args.max_seconds, bucket=args.bucket, lang=args.lang,
                        features=feats, streaming=True, seed=0):
-        ids = fwd(tower, head, b, arch, device, amp_dtype).argmax(-1).cpu().tolist()
-        for seq, ref, L in zip(ids, b["texts"], b["enc_lens"].tolist()):
+        logits, enc_lens = fwd(tower, head, b, arch, device, amp_dtype)
+        ids = logits.argmax(-1).cpu().tolist()
+        for seq, ref, L in zip(ids, b["texts"], enc_lens.cpu().tolist()):
             hyps.append(vocab.ctc_collapse(seq[:L]))
             refs.append(ref)
         if len(refs) >= n:
@@ -243,7 +252,8 @@ def main() -> None:
                        max_seconds=args.max_seconds, bucket=args.bucket, lang=args.lang,
                        features=feats, streaming=True, epochs=100):
         on_dev = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
-        loss = ctc_loss(fwd(tower, head, b, arch, device, amp_dtype), on_dev, vocab.blank)
+        logits, enc_lens = fwd(tower, head, b, arch, device, amp_dtype)
+        loss = ctc_loss(logits, enc_lens, on_dev, vocab.blank)
         dropped += b["dropped"]
         if not torch.isfinite(loss):
             dropped += 1

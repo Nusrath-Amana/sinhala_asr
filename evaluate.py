@@ -124,12 +124,16 @@ def main() -> None:
         f, m, flens = feats.batch([wav])
         t1 = time.perf_counter()
         with torch.no_grad():
-            enc = encode(tower, {"features": f, "mask": m}, arch, device, amp_dtype)
+            enc, enc_mask = encode(tower, {"features": f, "mask": m}, arch, device, amp_dtype)
             logits = head(enc.float())
         if device.type == "cuda":
             torch.cuda.synchronize()
         t2 = time.perf_counter()
-        L = min(arch.enc_len(flens[0]), logits.shape[1])
+        if enc_mask is not None and enc_mask.ndim == 2:
+            L = int(enc_mask[0].sum())
+        else:
+            L = min(arch.enc_len(flens[0]), logits.shape[1])
+        L = min(L, logits.shape[1])
         lg = logits[0, :L]
         if lm_decode:
             hyp = lm_decode(torch.log_softmax(lg, -1).cpu().numpy())

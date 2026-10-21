@@ -74,8 +74,15 @@ def main() -> None:
 
     how, feats, shapes = winner
     feat_key = max((k for k in shapes), key=lambda k: len(shapes[k]))
-    mask_key = next((k for k in shapes if "mask" in k.lower()), None)
-    print(f"\n  using {how}: features={feat_key}{shapes[feat_key]} mask={mask_key}")
+    tdim = shapes[feat_key][1]
+    # The mask must index the FEATURE time axis. A multimodal processor also returns the TEXT
+    # attention_mask, a different length entirely -- picking by name alone (as this first did)
+    # makes the tower fail with a 399-vs-104 size mismatch.
+    mask_key = next((k for k in shapes
+                     if "mask" in k.lower() and len(shapes[k]) == 2 and shapes[k][1] == tdim), None)
+    others = [k for k in shapes if "mask" in k.lower() and k != mask_key]
+    print(f"\n  using {how}: features={feat_key}{shapes[feat_key]} mask={mask_key}"
+          + (f"  (ignoring {others}: wrong axis)" if others else ""))
 
     dtype = getattr(torch, a.dtype)
     print(f"\n== loading audio_tower ({a.dtype}) ==")
@@ -87,22 +94,32 @@ def main() -> None:
 
     x = feats[feat_key].to(dtype)
     m = feats[mask_key] if mask_key else None
+    # transformers itself calls it positionally: audio_tower(input_features, input_features_mask)
     sigs = [("tower(x, mask)", lambda: tower(x, m)), ("tower(x)", lambda: tower(x))]
     if mask_key:
-        sigs.insert(0, (f"tower(x, {mask_key}=mask)", lambda: tower(**{feat_key: x, mask_key: m})))
-    out = None
+        sigs.insert(1, (f"tower({feat_key}=, {mask_key}=)",
+                        lambda: tower(**{feat_key: x, mask_key: m})))
+    out = ret = None
     print("\n== forward ==")
     with torch.no_grad():
         for label, fn in sigs:
             try:
                 r = fn()
                 out = r[0] if isinstance(r, tuple) else getattr(r, "last_hidden_state", r)
+                ret = r
                 print(f"  {label}: OK -> {tuple(out.shape)}")
                 break
             except Exception as e:  # noqa: BLE001
                 print(f"  {label}: ERR {type(e).__name__}: {e}")
     if out is None:
         raise SystemExit("audio_tower would not run. Paste the block above.")
+
+    # The tower returns its OWN downsampled frame mask (True = valid). Using that beats dividing
+    # the feature length by the stride, which drifts a frame on padded batches.
+    enc_mask = getattr(ret, "attention_mask", None)
+    returns_mask = enc_mask is not None and getattr(enc_mask, "ndim", 0) == 2
+    print(f"  tower returns a frame mask: {returns_mask}"
+          + (f" {tuple(enc_mask.shape)} valid={int(enc_mask.sum())}" if returns_mask else ""))
 
     n_feat_frames = shapes[feat_key][1]
     t_out = out.shape[1]
@@ -117,6 +134,7 @@ def main() -> None:
         "feat_frames": int(n_feat_frames),
         "encoder_frames": int(t_out),
         "feat_to_enc_downsample": round(n_feat_frames / t_out, 4),
+        "returns_mask": bool(returns_mask),
         "encoder_frames_per_second": round(t_out / a.seconds, 3),
         "seconds_per_encoder_frame": round(a.seconds / t_out, 5),
         "sample_rate": SR,
