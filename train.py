@@ -78,11 +78,41 @@ def resolve_ckpt(path: str, hub_repo: str | None) -> str | None:
         return None
 
 
+def patch_fp16_attn(module, dtype) -> int:
+    """Gemma4's audio attention masks invalid logits with `attention_invalid_logits_value`, which
+    the config sets to -1e9. fp16 tops out at 65504, so the masked_fill raises
+
+        RuntimeError: value cannot be converted to type c10::Half without overflow
+
+    the first time a padded batch reaches attention. Clamp the constant to the dtype's own floor;
+    anything that negative is zero after softmax, so the mask behaves identically.
+
+    Not needed for bf16 (same exponent range as fp32) or fp32, and T4/P100 have no bf16 -- so on
+    Kaggle this is the path that runs.
+    """
+    if dtype not in (torch.float16,):
+        return 0
+    lim = torch.finfo(dtype).min / 2          # -32752 for fp16
+    seen, n = set(), 0
+    for m in module.modules():
+        c = getattr(m, "config", None)
+        if c is None or id(c) in seen:
+            continue
+        seen.add(id(c))
+        v = getattr(c, "attention_invalid_logits_value", None)
+        if v is not None and v < lim:
+            c.attention_invalid_logits_value = lim
+            n += 1
+    return n
+
+
 def build(arch: D.Arch, n_vocab: int, head_hidden: int, device, dtype):
     from transformers import AutoModel
     full = AutoModel.from_pretrained(arch.model, revision=arch.revision, dtype=dtype)
     tower = full.audio_tower
     del full  # the language and vision towers play no part in this task
+    if patch_fp16_attn(tower, dtype):
+        print(f"  clamped attention_invalid_logits_value to {torch.finfo(dtype).min/2:.0f} for fp16")
     head = CTCHead(arch.encoder_dim, n_vocab, head_hidden)
     return tower.to(device), head.to(device).float()
 

@@ -181,6 +181,18 @@ If it still dies:
 encoder width, frame rate, stride, parameter count -- comes from the shapes, so random weights
 give an identical `arch.json`.
 
+### "value cannot be converted to type c10::Half without overflow"
+
+Not a bad run -- an fp16 limit in Gemma4's audio attention. Its config masks invalid logits with
+`attention_invalid_logits_value: -1e9`, and fp16 tops out at 65504, so the `masked_fill` throws the
+first time a padded batch reaches attention. Fixed in `train.py` (`patch_fp16_attn`), which clamps
+the constant to the dtype floor; anything that negative is zero after softmax, so the mask is
+unchanged. `git pull` and re-run.
+
+It only affects fp16. bf16 has fp32's exponent range -- but T4 and P100 have no bf16, so fp16 is
+the path that runs on Kaggle. If you ever see it again, `--amp off` runs the tower in fp32: correct,
+slower, more memory.
+
 ### Resharding (required before training)
 
 `train.py` needs the audio column, so column pruning cannot help it. Rewrite the split once with

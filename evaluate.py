@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 import data as D
-from train import CTCHead, encode
+from train import CTCHead, encode, patch_fp16_attn
 
 
 def load_ckpt(path, arch, n_vocab, device, dtype):
@@ -37,6 +37,7 @@ def load_ckpt(path, arch, n_vocab, device, dtype):
     full = AutoModel.from_pretrained(arch.model, revision=arch.revision, dtype=dtype)
     tower = full.audio_tower
     del full
+    patch_fp16_attn(tower, dtype)   # -1e9 mask constant overflows fp16; see train.py
     if ck.get("tower"):
         missing = tower.load_state_dict(ck["tower"], strict=False)
         print(f"  encoder: loaded finetuned weights ({missing})")
