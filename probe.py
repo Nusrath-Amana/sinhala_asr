@@ -34,7 +34,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--revision", default=None)
-    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"])
+    ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"],
+                    help="bf16 halves peak RAM vs fp32; shapes are identical either way")
+    ap.add_argument("--no-weights", action="store_true",
+                    help="build the tower from config with random init: same shapes, same param "
+                         "count, no 1.49 GB download and ~half the peak RAM. Use this if the "
+                         "session OOMs -- probe only measures shapes.")
     ap.add_argument("--seconds", type=float, default=4.0)
     ap.add_argument("--out", default="arch.json")
     a = ap.parse_args()
@@ -85,12 +90,24 @@ def main() -> None:
           + (f"  (ignoring {others}: wrong axis)" if others else ""))
 
     dtype = getattr(torch, a.dtype)
-    print(f"\n== loading audio_tower ({a.dtype}) ==")
-    model = AutoModel.from_pretrained(a.model, revision=a.revision, dtype=dtype)
-    tower = model.audio_tower
+    if a.no_weights:
+        # Shapes and parameter counts come from the config; the weights' values are irrelevant to
+        # everything this script measures. Avoids loading the full 744M model to look at the 305M
+        # audio tower, which is what makes a small session OOM.
+        print(f"\n== building audio_tower from config, random init ({a.dtype}) ==")
+        model = AutoModel.from_config(cfg)
+        tower = model.audio_tower.to(dtype)
+    else:
+        print(f"\n== loading audio_tower ({a.dtype}) ==")
+        model = AutoModel.from_pretrained(a.model, revision=a.revision, dtype=dtype)
+        tower = model.audio_tower
     n_tower = sum(p.numel() for p in tower.parameters())
     print(f"  audio_tower params: {n_tower/1e6:.1f}M   layers: {len(tower.layers)}")
     print(f"  full model params:  {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+    model.audio_tower = None          # drop the rest of the model before the forward pass
+    del model
+    import gc
+    gc.collect()
 
     x = feats[feat_key].to(dtype)
     m = feats[mask_key] if mask_key else None

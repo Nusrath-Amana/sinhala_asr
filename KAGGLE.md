@@ -146,6 +146,35 @@ training on character units that cannot fit the frames wastes the whole budget.
 Also copy `arch.json` and `vocab.json` into your local repo and commit them; they are a few hundred
 bytes and it saves ever running notebook A again.
 
+### "Your notebook tried to allocate more memory than is available"
+
+Kaggle's own OOM killer, not a code crash. Two causes, both fixed in the current scripts -- run
+`git pull` first -- and two escape hatches:
+
+| script | why it ballooned | fix |
+|---|---|---|
+| `vocab.py` | read the `audio` column (megabytes a row) just to count characters | two passes: text via `select_columns`, durations over `--rate-sample 1500` only |
+| `probe.py` | loaded the whole 744M model in fp32 (~3 GB, plus a copy) to reach the 305M tower | `--dtype bfloat16` is now the default, and the rest of the model is freed before the forward |
+
+If it still dies:
+
+```python
+!python probe.py --no-weights          # shapes only: no 1.49 GB download, ~half the RAM
+!python vocab.py --report --limit 40000 --rate-sample 800
+```
+
+`--no-weights` builds the tower from its config with random init. Every number probe reports --
+encoder width, frame rate, stride, parameter count -- comes from the shapes, so random weights
+give an identical `arch.json`.
+
+Check what you actually have before guessing:
+
+```python
+!free -g; nproc
+```
+
+A CPU session has far more RAM than a GPU one, which is the other reason to keep notebook A on CPU.
+
 ### Notebook B — training (GPU P100)
 
 ```python
