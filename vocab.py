@@ -62,6 +62,8 @@ def text_pass(repo: str, split: str, limit: int):
     langs: collections.Counter = collections.Counter()
     sources: collections.Counter = collections.Counter()
     mixed = n = 0
+    import time
+    t0 = time.time()
     for row in ds:
         t = norm(row["text"])
         counts.update(t)
@@ -75,8 +77,12 @@ def text_pass(repo: str, split: str, limit: int):
         n += 1
         if limit and n >= limit:
             break
-        if n % 20000 == 0:
-            print(f"  {n:,} rows...")
+        # An early heartbeat, then regular ones: the first parquet row group takes a while to
+        # open and a silent terminal is indistinguishable from a hung stream.
+        if n in (1, 500) or n % 5000 == 0:
+            el = time.time() - t0
+            print(f"  {n:,} rows  {el:.0f}s  {n/max(el,1e-9):.0f} rows/s", flush=True)
+    print(f"  done: {n:,} rows in {time.time()-t0:.0f}s", flush=True)
     return counts, scripts, langs, sources, mixed, n
 
 
