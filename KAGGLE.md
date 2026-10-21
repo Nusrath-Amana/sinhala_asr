@@ -81,60 +81,126 @@ session's disk or your upload bandwidth.
    the Hub push. Needs phone verification on the account.
 3. **Add-ons → Secrets → Add secret**, name `HF_TOKEN`, value a Hub token with **write** access.
 
-## The notebook, cell by cell
+## Two notebooks, not one
+
+A Kaggle **CPU session does not spend GPU quota**, and `probe.py` / `vocab.py` need no GPU. Running
+them in your training notebook burns ~20 minutes of a 30-hour weekly budget for nothing.
+
+| | notebook A — "asr-setup" | notebook B — "asr-train" |
+|---|---|---|
+| Accelerator | **None (CPU)** | **GPU P100** |
+| Internet | On | On |
+| `HF_TOKEN` attached | yes | yes |
+| runs | `probe.py`, `vocab.py` | `train.py`, `evaluate.py` |
+| Save Version | not needed | **yes, for the long runs** |
+
+The two share results through the Hub repo, the same way checkpoints do.
+
+### Notebook A — setup (CPU, run once, ~30 min)
 
 ```python
-# 1. code + deps
+# A1 - code + deps
+!git clone https://github.com/YOU/sinhala_asr.git /kaggle/working/code
+%cd /kaggle/working/code
+!pip install -q -r requirements.txt
+# Kaggle's preinstalled transformers is too old for embedding_gemma2 (added in 5.19.0).
+# Confirm the upgrade actually took effect:
+!python -c "import transformers; print(transformers.__version__)"   # must be >= 5.19
+```
+
+**`KeyError: 'embedding_gemma2'`** from `AutoConfig` means that upgrade did not happen. No kernel
+restart is needed as long as the scripts run via `!python ...` -- each is a fresh process that picks
+up the new version. Only an `import transformers` *inside* a notebook cell needs
+*Run -> Restart session* after upgrading.
+
+```python
+# A2 - Hub login, and prove the token works before anything long
+from kaggle_secrets import UserSecretsClient
+from huggingface_hub import login, whoami
+login(UserSecretsClient().get_secret("HF_TOKEN"))
+print(whoami()["name"])
+```
+
+```python
+# A3 - architecture -> arch.json
+!python probe.py
+```
+
+```python
+# A4 - vocabulary + the frame-rate GATE -> vocab.json
+!python vocab.py --report --limit 20000
+```
+
+```python
+# A5 - park both on the Hub so notebook B (and Colab) can fetch them
+from huggingface_hub import upload_file
+REPO = "YOURNAME/sinhala-gemma-ctc"
+for f in ("arch.json", "vocab.json"):
+    upload_file(path_or_fileobj=f, path_in_repo=f, repo_id=REPO)
+    print("pushed", f)
+```
+
+Read A4's verdict before going further. If the p95 headroom fails, switch to subword units now --
+training on character units that cannot fit the frames wastes the whole budget.
+
+Also copy `arch.json` and `vocab.json` into your local repo and commit them; they are a few hundred
+bytes and it saves ever running notebook A again.
+
+### Notebook B — training (GPU P100)
+
+```python
+# B1 - code + deps
 !git clone https://github.com/YOU/sinhala_asr.git /kaggle/working/code
 %cd /kaggle/working/code
 !pip install -q -r requirements.txt
 ```
 
 ```python
-# 2. Hub login (write token, from Kaggle Secrets)
+# B2 - Hub login
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
 login(UserSecretsClient().get_secret("HF_TOKEN"))
 ```
 
 ```python
-# 3. architecture — writes arch.json. Do this once on a CPU session to save GPU quota.
-!python probe.py
+# B3 - fetch what notebook A produced (skip if they are committed in the repo)
+from huggingface_hub import hf_hub_download
+import shutil
+REPO = "YOURNAME/sinhala-gemma-ctc"
+for f in ("arch.json", "vocab.json"):
+    shutil.copy(hf_hub_download(repo_id=REPO, filename=f), f)
+!ls -la arch.json vocab.json
 ```
 
 ```python
-# 4. vocabulary + the frame-rate safety check. Also CPU-only.
-!python vocab.py --report --limit 20000
-```
-
-```python
-# 5. smoke test: does the pipeline run end to end, and what is rows/s?
+# B4 - SMOKE TEST. Read rows/s from this before anything longer.
 !python train.py --freeze-encoder --max-steps 200 --subset 500 --out /kaggle/working/ckpt
 ```
 
-Read `rows/s` from that output and compute `epoch_hours = 108278 / rows_per_sec / 3600` before
-committing to anything longer. Then:
-
 ```python
-# 6. head-only baseline (~1.2 epochs at the defaults)
-!python train.py --freeze-encoder --max-steps 4000 \
-    --out /kaggle/working/ckpt --hub-repo YOURNAME/sinhala-gemma-ctc
+# B5 - epoch time from the measured rows/s
+rows_per_sec = 10.0          # <- replace with what B4 printed
+print(f"one epoch = {108278/rows_per_sec/3600:.1f} h")
 ```
 
 ```python
-# 7. the real run — Save & Run All for this one. Re-run the same cell to continue after a cap.
-!python train.py --unfreeze-top 8 --lr 2e-5 --max-steps 12000 \
-    --out /kaggle/working/ckpt --hub-repo YOURNAME/sinhala-gemma-ctc \
-    --resume ckpt/last.pt
+# B6 - head-only baseline (~1.2 epochs)
+!python train.py --freeze-encoder --max-steps 4000     --out /kaggle/working/ckpt --hub-repo YOURNAME/sinhala-gemma-ctc
 ```
 
 ```python
-# 8. score it
+# B7 - the real run. Re-run this same cell after each 12-hour cap; --resume pulls from the Hub.
+!python train.py --unfreeze-top 8 --lr 2e-5 --max-steps 12000     --out /kaggle/working/ckpt --hub-repo YOURNAME/sinhala-gemma-ctc     --resume ckpt/last.pt
+```
+
+```python
+# B8 - score it
 !python evaluate.py --ckpt /kaggle/working/ckpt/last.pt --split test --limit 2000
 ```
 
-Commit `arch.json` and `vocab.json` to your repo after step 4 — they are tiny, and every later
-session then skips straight to training.
+**Run B4 interactively** (you need to see `rows/s`). **Commit B7** via Save Version -> Save & Run
+All, because an interactive session can die when you close the browser. Comment out the cells you
+are not running in a committed version -- a commit runs every cell top to bottom.
 
 ## Colab differences
 

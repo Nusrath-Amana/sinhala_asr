@@ -1,5 +1,7 @@
-# Pinned loosely: Kaggle images move. transformers must be new enough for embedding_gemma2.
-transformers>=4.57
+# embedding_gemma2 support landed in transformers 5.19.0 (absent in 5.18.0). Kaggle's image
+# ships something older, so this MUST be upgraded in the session or AutoConfig raises
+# KeyError: 'embedding_gemma2'. Latest at time of writing: 5.20.2.
+transformers>=5.19
 torch>=2.4
 datasets>=3.0
 soundfile>=0.12
