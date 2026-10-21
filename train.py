@@ -231,6 +231,17 @@ def main() -> None:
         step = ck["step"]
         print(f"resumed at step {step}")
 
+    if args.hub_repo:
+        # Create it up front: upload_file does NOT create a missing repo, and finding that out
+        # from the first --save-every push would mean an hour of training pushed nowhere.
+        try:
+            from huggingface_hub import create_repo
+            create_repo(args.hub_repo, exist_ok=True)
+            print(f"checkpoints -> https://huggingface.co/{args.hub_repo}")
+        except Exception as e:  # noqa: BLE001
+            print(f"!! cannot use --hub-repo {args.hub_repo}: {e}\n"
+                  f"!! training will run but NOTHING will be pushed; a session cap loses it all")
+
     def save(tag="last"):
         p = os.path.join(args.out, f"{tag}.pt")
         torch.save({"head": head.state_dict(),
