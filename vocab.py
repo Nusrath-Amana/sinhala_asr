@@ -176,8 +176,11 @@ def main() -> None:
     if not a.report:
         return
 
-    print(f"\npass 2: grapheme rate over {a.rate_sample:,} rows (reads audio headers)")
-    rates, worst = rate_pass(a.repo, a.split, a.rate_sample)
+    if a.rate_split == "train":
+        raise SystemExit("--rate-split train would load a 14.1 GB audio column in one row group "
+                         "and be OOM-killed. Use validation (1.46 GB) or test (1.63 GB).")
+    print(f"\npass 2: grapheme rate, {a.rate_sample:,} rows from the {a.rate_split} split")
+    rates, worst = rate_pass(a.repo, a.rate_split, a.rate_sample)
     if not rates:
         print("  no durations read -- skipping the check")
         return
