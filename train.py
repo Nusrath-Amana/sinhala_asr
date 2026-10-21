@@ -325,7 +325,10 @@ def main() -> None:
                 print(f"{step:6d}  {run/max(nrun,1):8.4f}  {sched.get_last_lr()[0]:.2e}  "
                       f"{seen/(time.time()-t0):7.1f}  {dropped}")
                 run, nrun = 0.0, 0
-            if step % args.save_every == 0:
+            # Save early once, then on the regular cadence: the first push is the only proof that
+            # --hub-repo works, and waiting 500 steps for it makes a healthy run indistinguishable
+            # from a hung one.
+            if step == 25 or step % args.save_every == 0:
                 save("last")
             if args.eval_every and step % args.eval_every == 0:
                 w, c, n = quick_wer(tower, head, arch, vocab, args, device, amp_dtype, feats)
