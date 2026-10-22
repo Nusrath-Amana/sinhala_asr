@@ -8,6 +8,7 @@ soundfile>=0.12
 numpy>=1.26
 jiwer>=3.0
 huggingface_hub>=0.26
-# Decoding with the 4-gram (step 3, not needed to train):
-# pyctcdecode>=0.5.0
-# kenlm @ https://github.com/kpu/kenlm/archive/master.zip
+# Decoding with the 4-gram. Not needed to train; install before evaluate.py --kenlm.
+# `kenlm` here is the SCORER only -- build_lm.py compiles lmplz (the trainer) from source.
+# pip install pyctcdecode "kenlm @ https://github.com/kpu/kenlm/archive/master.zip"
+pyarrow>=14.0
