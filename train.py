@@ -275,10 +275,23 @@ def main() -> None:
         head.load_state_dict(ck["head"])
         if ck.get("tower"):
             tower.load_state_dict(ck["tower"], strict=False)
-        opt.load_state_dict(ck["opt"])
-        sched.load_state_dict(ck["sched"])
-        step = ck["step"]
-        print(f"resumed at step {step}")
+        # Stage 2 trains one param group (the head); stage 3 adds a second (the unfrozen encoder
+        # layers). Loading stage 2's optimizer state into stage 3 raises "loaded state dict has a
+        # different number of parameter groups" -- seconds into a multi-hour run. When the
+        # trainable set has changed, keep the weights and restart the optimizer and schedule.
+        prev, now = ck["opt"]["param_groups"], opt.param_groups
+        same = len(prev) == len(now) and all(len(a["params"]) == len(b["params"])
+                                             for a, b in zip(prev, now))
+        if same:
+            opt.load_state_dict(ck["opt"])
+            sched.load_state_dict(ck["sched"])
+            step = ck["step"]
+            print(f"resumed at step {step}")
+        else:
+            print(f"loaded weights from step {ck['step']}; optimizer state dropped because the "
+                  f"trainable set changed ({len(prev)} group(s) -> {len(now)}). "
+                  f"Warmup and the cosine schedule restart from 0 -- which is what you want when "
+                  f"unfreezing.")
 
     if args.hub_repo:
         # Create it up front: upload_file does NOT create a missing repo, and finding that out
