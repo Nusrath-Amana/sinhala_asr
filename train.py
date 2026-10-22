@@ -21,6 +21,7 @@ import json
 import math
 import os
 import signal
+import sys
 import time
 
 import torch
@@ -311,7 +312,10 @@ def main() -> None:
     tower.train()
     head.train()
     run, nrun, micro, dropped = 0.0, 0, 0, 0
-    print("step      loss      lr        rows/s   dropped")
+    # Time training only: the 1.5 GB model download and the processor fetch would otherwise
+    # dominate a short run and make rows/s meaningless.
+    t_train = time.time()
+    print("step      loss      lr        rows/s   dropped", flush=True)
     for b in D.batches(args.repo, args.train_split, arch, vocab, batch_size=args.batch_size,
                        max_seconds=args.max_seconds, bucket=args.bucket, lang=args.lang,
                        features=feats, streaming=True, epochs=100):
@@ -339,9 +343,9 @@ def main() -> None:
             sched.step()
             step += 1
 
-            if step % 50 == 0:
+            if step % 10 == 0:
                 print(f"{step:6d}  {run/max(nrun,1):8.4f}  {sched.get_last_lr()[0]:.2e}  "
-                      f"{seen/(time.time()-t0):7.1f}  {dropped}")
+                      f"{seen/max(time.time()-t_train,1e-9):7.1f}  {dropped}", flush=True)
                 run, nrun = 0.0, 0
             # Save early once, then on the regular cadence: the first push is the only proof that
             # --hub-repo works, and waiting 500 steps for it makes a healthy run indistinguishable
@@ -357,10 +361,19 @@ def main() -> None:
             break
 
     save("last")
+    rate = seen / max(time.time() - t_train, 1e-9)
     w, c, n = quick_wer(tower, head, arch, vocab, args, device, amp_dtype, feats)
     print(f"FINAL [val n={n}] WER {w:.4f}  CER {c:.4f}  steps={step}  rows={seen}")
-    json.dump({"wer": w, "cer": c, "n": n, "steps": step, "rows": seen},
+    print(f"THROUGHPUT {rate:.1f} rows/s  ->  1 epoch of train (108,278 rows) = "
+          f"{108278/rate/3600:.1f} h", flush=True)
+    json.dump({"wer": w, "cer": c, "n": n, "steps": step, "rows": seen,
+               "rows_per_sec": round(rate, 2), "epoch_hours": round(108278 / rate / 3600, 2)},
               open(os.path.join(args.out, "result.json"), "w"), indent=2)
+    # `datasets` streaming leaves non-daemon worker threads alive, so the process can hang after
+    # the last line is printed. Everything is saved by here; leave immediately.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
