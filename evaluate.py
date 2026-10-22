@@ -32,12 +32,18 @@ from train import CTCHead, encode, patch_fp16_attn
 
 
 def load_ckpt(path, arch, n_vocab, device, dtype):
-    from transformers import AutoModel
+    from transformers import AutoConfig, AutoModel
     ck = torch.load(path, map_location="cpu")
-    full = AutoModel.from_pretrained(arch.model, revision=arch.revision, dtype=dtype)
+    cfg = AutoConfig.from_pretrained(arch.model, revision=arch.revision)
+    if dtype == torch.float16:      # -1e9 mask constant overflows fp16; see train.build()
+        lim = float(torch.finfo(dtype).min / 2)
+        for c in (cfg, getattr(cfg, "audio_config", None)):
+            if c is not None and getattr(c, "attention_invalid_logits_value", 0) < lim:
+                c.attention_invalid_logits_value = lim
+    full = AutoModel.from_pretrained(arch.model, revision=arch.revision, config=cfg, dtype=dtype)
     tower = full.audio_tower
     del full
-    patch_fp16_attn(tower, dtype)   # -1e9 mask constant overflows fp16; see train.py
+    patch_fp16_attn(tower, dtype)
     if ck.get("tower"):
         missing = tower.load_state_dict(ck["tower"], strict=False)
         print(f"  encoder: loaded finetuned weights ({missing})")

@@ -107,12 +107,30 @@ def patch_fp16_attn(module, dtype) -> int:
 
 
 def build(arch: D.Arch, n_vocab: int, head_hidden: int, device, dtype):
-    from transformers import AutoModel
-    full = AutoModel.from_pretrained(arch.model, revision=arch.revision, dtype=dtype)
+    from transformers import AutoConfig, AutoModel
+    # Patch the CONFIG BEFORE constructing the model. Attention modules capture the config object
+    # at __init__, so clamping it afterwards by walking .modules() does not reliably reach the one
+    # they actually read -- the -1e9 overflow came straight back.
+    cfg = AutoConfig.from_pretrained(arch.model, revision=arch.revision)
+    lim = float(torch.finfo(dtype).min / 2) if dtype == torch.float16 else None
+    if lim is not None:
+        for c in (cfg, getattr(cfg, "audio_config", None)):
+            if c is not None and getattr(c, "attention_invalid_logits_value", 0) < lim:
+                c.attention_invalid_logits_value = lim
+        print(f"  attention_invalid_logits_value -> {lim:.0f} (fp16 cannot hold -1e9)")
+    full = AutoModel.from_pretrained(arch.model, revision=arch.revision, config=cfg, dtype=dtype)
     tower = full.audio_tower
     del full  # the language and vision towers play no part in this task
-    if patch_fp16_attn(tower, dtype):
-        print(f"  clamped attention_invalid_logits_value to {torch.finfo(dtype).min/2:.0f} for fp16")
+    if lim is not None:
+        patch_fp16_attn(tower, dtype)      # belt and braces for any config built separately
+        seen = {getattr(getattr(m, "config", None), "attention_invalid_logits_value", None)
+                for m in tower.modules()}
+        seen.discard(None)
+        print(f"  verified mask constants in the tower: {sorted(seen)}")
+        bad = [v for v in seen if v < torch.finfo(dtype).min]
+        if bad:
+            raise SystemExit(f"mask constant {bad} still unrepresentable in {dtype}; "
+                             f"re-run with --amp off to use fp32")
     head = CTCHead(arch.encoder_dim, n_vocab, head_hidden)
     return tower.to(device), head.to(device).float()
 
