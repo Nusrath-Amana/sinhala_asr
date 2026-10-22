@@ -107,13 +107,17 @@ def patch_fp16_attn(module, dtype) -> int:
     return n
 
 
-def build(arch: D.Arch, n_vocab: int, head_hidden: int, device, dtype):
+def build(arch: D.Arch, n_vocab: int, head_hidden: int, device, dtype, clamp_dtype=None):
+    """`dtype` is how the weights are stored; `clamp_dtype` is the dtype the ACTIVATIONS will be.
+    They differ once the encoder is trained: the weights must be fp32 for GradScaler, while
+    autocast still produces fp16 attention logits that need the mask constant clamped."""
     from transformers import AutoConfig, AutoModel
+    clamp_dtype = clamp_dtype or dtype
     # Patch the CONFIG BEFORE constructing the model. Attention modules capture the config object
     # at __init__, so clamping it afterwards by walking .modules() does not reliably reach the one
     # they actually read -- the -1e9 overflow came straight back.
     cfg = AutoConfig.from_pretrained(arch.model, revision=arch.revision)
-    lim = float(torch.finfo(dtype).min / 2) if dtype == torch.float16 else None
+    lim = float(torch.finfo(clamp_dtype).min / 2) if clamp_dtype == torch.float16 else None
     if lim is not None:
         for c in (cfg, getattr(cfg, "audio_config", None)):
             if c is not None and getattr(c, "attention_invalid_logits_value", 0) < lim:
@@ -123,14 +127,14 @@ def build(arch: D.Arch, n_vocab: int, head_hidden: int, device, dtype):
     tower = full.audio_tower
     del full  # the language and vision towers play no part in this task
     if lim is not None:
-        patch_fp16_attn(tower, dtype)      # belt and braces for any config built separately
+        patch_fp16_attn(tower, clamp_dtype)   # belt and braces for any config built separately
         seen = {getattr(getattr(m, "config", None), "attention_invalid_logits_value", None)
                 for m in tower.modules()}
         seen.discard(None)
         print(f"  verified mask constants in the tower: {sorted(seen)}")
-        bad = [v for v in seen if v < torch.finfo(dtype).min]
+        bad = [v for v in seen if v < torch.finfo(clamp_dtype).min]
         if bad:
-            raise SystemExit(f"mask constant {bad} still unrepresentable in {dtype}; "
+            raise SystemExit(f"mask constant {bad} still unrepresentable in {clamp_dtype}; "
                              f"re-run with --amp off to use fp32")
     head = CTCHead(arch.encoder_dim, n_vocab, head_hidden)
     return tower.to(device), head.to(device).float()
@@ -245,11 +249,22 @@ def main() -> None:
         amp_dtype = torch.float16
     if device.type == "cpu":
         amp_dtype = None
-    load_dtype = torch.float32 if device.type == "cpu" else torch.float16
+    # WEIGHT dtype. GradScaler refuses to unscale gradients of fp16 parameters ("Attempting to
+    # unscale FP16 gradients"), so anything we actually train must be stored fp32 and reach fp16
+    # only through autocast. With the encoder frozen it has no gradients, so fp16 weights are fine
+    # there and halve its memory.
+    train_encoder = (not args.freeze_encoder) and args.unfreeze_top > 0
+    if device.type == "cpu" or train_encoder:
+        load_dtype = torch.float32
+    else:
+        load_dtype = torch.float16
+    print(f"weights={str(load_dtype).replace('torch.','')} "
+          f"(encoder {'trained -> fp32 master weights' if train_encoder else 'frozen -> fp16'})")
 
     print(f"device={device} amp={amp_dtype} vocab={len(vocab)} "
           f"enc_dim={arch.encoder_dim} enc_fps={arch.fps}")
-    tower, head = build(arch, len(vocab), args.head_hidden, device, load_dtype)
+    tower, head = build(arch, len(vocab), args.head_hidden, device, load_dtype,
+                        clamp_dtype=amp_dtype or load_dtype)
     n_unfrozen = set_trainable(tower, 0 if args.freeze_encoder else args.unfreeze_top)
     print(f"trainable: head {sum(p.numel() for p in head.parameters())/1e6:.2f}M "
           f"+ encoder {n_unfrozen/1e6:.2f}M")
