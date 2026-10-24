@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 import data as D
-from train import CTCHead, encode, patch_fp16_attn
+from train import CTCHead, encode, patch_fp16_attn, resolve_ckpt
 
 
 def load_ckpt(path, arch, n_vocab, device, dtype):
@@ -83,7 +83,11 @@ def local_rows(audio_dir, sr):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", required=True,
+                    help="a local file, or hf://<repo>/<file>. A bare name is also looked up in "
+                         "--hub-repo, so a wiped /kaggle/working costs nothing.")
+    ap.add_argument("--hub-repo", default=None,
+                    help="where to fetch --ckpt from when it is not on disk")
     ap.add_argument("--arch", default="arch.json")
     ap.add_argument("--vocab", default="vocab.json")
     ap.add_argument("--repo", default="SinhaSpeech/sinhala-asr-data-v7")
@@ -111,7 +115,13 @@ def main() -> None:
         amp_dtype = None
     load_dtype = torch.float32 if device.type == "cpu" else torch.float16
     print(f"device={device} amp={amp_dtype}")
-    tower, head, ck = load_ckpt(a.ckpt, arch, len(vocab), device, load_dtype)
+    ckpt_path = resolve_ckpt(a.ckpt, a.hub_repo)
+    if ckpt_path is None:
+        raise SystemExit(
+            f"no checkpoint at {a.ckpt!r}. A Kaggle session wipes /kaggle/working, but training "
+            f"pushed it to the Hub -- pass --hub-repo <user>/sinhala-gemma-ctc, or "
+            f"--ckpt hf://<user>/sinhala-gemma-ctc/last.pt")
+    tower, head, ck = load_ckpt(ckpt_path, arch, len(vocab), device, load_dtype)
     print(f"  checkpoint step {ck['step']}")
 
     hot = []
