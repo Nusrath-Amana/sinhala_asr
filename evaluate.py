@@ -96,7 +96,12 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=2000)
     ap.add_argument("--lang", default=None)
     ap.add_argument("--max-seconds", type=float, default=16.0)
-    ap.add_argument("--kenlm", default=None)
+    ap.add_argument("--kenlm", default=None,
+                    help="a KenLM .bin, decoded by pyctcdecode. Needs the `kenlm` python module, "
+                         "which has no cp313 wheel -- use --arpa on Kaggle instead.")
+    ap.add_argument("--arpa", default=None,
+                    help="an lmplz .arpa, scored by arpa_lm.py (pure python, no compiler). "
+                         "Beam search runs without an LM and the n-best list is rescored.")
     ap.add_argument("--beam", type=int, default=100)
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--beta", type=float, default=1.5)
@@ -128,9 +133,30 @@ def main() -> None:
     if a.hotwords and os.path.exists(a.hotwords):
         hot = [l.strip() for l in open(a.hotwords, encoding="utf-8") if l.strip()]
         print(f"  {len(hot)} hotwords")
-    lm_decode = make_decoder(a.kenlm, vocab, a.beam, a.alpha, a.beta, hot,
-                             a.hotword_weight) if a.kenlm else None
-    print(f"  decode: {'KenLM beam ' + str(a.beam) if lm_decode else 'greedy'}")
+    lm_decode = None
+    if a.kenlm:
+        lm_decode = make_decoder(a.kenlm, vocab, a.beam, a.alpha, a.beta, hot, a.hotword_weight)
+        mode = f"KenLM beam {a.beam}"
+    elif a.arpa:
+        # Beam search with NO LM compiled in, then rescore the n-best with the ARPA ourselves.
+        from pyctcdecode import build_ctcdecoder
+
+        from arpa_lm import ArpaLM, rescore
+        labels = ["" if i == vocab.blank else (" " if i == vocab.delim else vocab.itos.get(i, ""))
+                  for i in range(len(vocab))]
+        dec = build_ctcdecoder(labels)
+        lm = ArpaLM(a.arpa)
+        if hot:
+            print(f"  note: --hotwords needs the kenlm path; ignored when rescoring an ARPA")
+
+        def lm_decode(logits, _dec=dec, _lm=lm):
+            beams = _dec.decode_beams(logits, beam_width=a.beam)
+            return rescore(beams, _lm, a.alpha, a.beta)
+
+        mode = f"ARPA rescore, beam {a.beam}"
+    else:
+        mode = "greedy"
+    print(f"  decode: {mode}")
 
     feats = D.Features(arch)
     t_feat, t_enc, t_dec, secs = [], [], [], []
@@ -196,7 +222,7 @@ def main() -> None:
     total = [f + e + d for f, e, d in zip(t_feat, t_enc, t_dec)]
     res = {
         "ckpt": a.ckpt, "step": ck["step"], "n": len(R),
-        "decode": f"kenlm-beam{a.beam}" if lm_decode else "greedy",
+        "decode": mode,
         "wer": round(wer, 4), "cer": round(cer, 4),
         "audio_s_median": round(st.median(secs), 2),
         "ms": {k: {"p50": round(p(v, 0.5), 1), "p95": round(p(v, 0.95), 1)}

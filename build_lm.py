@@ -38,6 +38,14 @@ def sh(cmd: str, **kw) -> None:
     subprocess.run(cmd, shell=True, check=True, **kw)
 
 
+def _have_kenlm() -> bool:
+    try:
+        import kenlm  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def install_scorer(prefix: str) -> bool:
     """Install the kenlm PYTHON module (what pyctcdecode imports at decode time).
 
@@ -114,7 +122,9 @@ def main() -> None:
     ap.add_argument("--extra-text", default=None, help="estate vocabulary, one line per phrase")
     ap.add_argument("--extra-weight", type=int, default=200, help="times to repeat --extra-text")
     ap.add_argument("--prune", default="0 0 1", help="lmplz --prune; '' disables")
-    ap.add_argument("--keep-arpa", action="store_true")
+    ap.add_argument("--no-keep-arpa", action="store_true",
+                    help="delete the .arpa. Keep it by default: it is what evaluate.py --arpa "
+                         "reads, and that path needs no kenlm binding.")
     ap.add_argument("--work", default="/kaggle/temp/lm", help="scratch for the corpus and KenLM")
     ap.add_argument("--push-to", default=None, help="HF repo to upload the .bin to")
     ap.add_argument("--no-scorer", action="store_true",
@@ -161,15 +171,21 @@ def main() -> None:
     print(f"\nbuild_binary -> {a.out}")
     sh(f'"{build_binary}" "{arpa}" "{a.out}"')
     print(f"  {a.out}: {os.path.getsize(a.out)/1e6:.1f} MB")
-    if not a.keep_arpa:
+    arpa_kept = None
+    if a.no_keep_arpa:
         os.remove(arpa)
+    else:
+        arpa_kept = os.path.splitext(a.out)[0] + ".arpa"
+        shutil.move(arpa, arpa_kept)
+        print(f"  {arpa_kept}: {os.path.getsize(arpa_kept)/1e6:.1f} MB (for evaluate.py --arpa)")
 
     if a.push_to:
         from huggingface_hub import create_repo, upload_file
         create_repo(a.push_to, exist_ok=True)
-        upload_file(path_or_fileobj=a.out, path_in_repo=os.path.basename(a.out),
-                    repo_id=a.push_to)
-        print(f"  pushed to https://huggingface.co/{a.push_to}")
+        for f in (a.out, arpa_kept):
+            if f and os.path.exists(f):
+                upload_file(path_or_fileobj=f, path_in_repo=os.path.basename(f), repo_id=a.push_to)
+                print(f"  pushed {os.path.basename(f)} to https://huggingface.co/{a.push_to}")
 
     print("\nNext -- score greedy against LM-decoded on the SAME checkpoint:")
     print("  python evaluate.py --ckpt ckpt/last.pt --split test --limit 2000")
