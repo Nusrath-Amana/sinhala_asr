@@ -38,6 +38,37 @@ def sh(cmd: str, **kw) -> None:
     subprocess.run(cmd, shell=True, check=True, **kw)
 
 
+def install_scorer(prefix: str) -> bool:
+    """Install the kenlm PYTHON module (what pyctcdecode imports at decode time).
+
+    `pip install kenlm` builds in an isolated environment that cannot see the system boost, so it
+    fails on Kaggle even once lmplz has compiled. Build it from the tree we already cloned, with
+    --no-build-isolation so it uses the system toolchain and headers.
+    """
+    try:
+        import kenlm  # noqa: F401
+        print("  kenlm python module already present")
+        return True
+    except ImportError:
+        pass
+    src = os.path.join(prefix, "kenlm")
+    for label, cmd in (
+        ("local tree", f'"{sys.executable}" -m pip install -q --no-build-isolation "{src}"'),
+        ("pypi", f'"{sys.executable}" -m pip install -q --no-build-isolation kenlm'),
+    ):
+        try:
+            print(f"  installing kenlm python module from {label}", flush=True)
+            subprocess.run(cmd, shell=True, check=True)
+            subprocess.run(f'"{sys.executable}" -c "import kenlm"', shell=True, check=True)
+            print(f"  kenlm python module OK (from {label})")
+            return True
+        except subprocess.CalledProcessError:
+            print(f"  {label} failed", flush=True)
+    print("  !! could not install the kenlm scorer. The .bin below is still valid -- you can\n"
+          "     decode with it elsewhere -- but evaluate.py --kenlm will not run here.")
+    return False
+
+
 def ensure_kenlm(prefix: str) -> str:
     """Return a path to lmplz, building KenLM if needed."""
     found = shutil.which("lmplz")
@@ -86,12 +117,20 @@ def main() -> None:
     ap.add_argument("--keep-arpa", action="store_true")
     ap.add_argument("--work", default="/kaggle/temp/lm", help="scratch for the corpus and KenLM")
     ap.add_argument("--push-to", default=None, help="HF repo to upload the .bin to")
+    ap.add_argument("--no-scorer", action="store_true",
+                    help="skip installing the kenlm python module / pyctcdecode")
     a = ap.parse_args()
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     os.makedirs(a.work, exist_ok=True)
     lmplz = ensure_kenlm(a.work)
     build_binary = os.path.join(os.path.dirname(lmplz), "build_binary")
+    if not a.no_scorer:
+        print("\ndecode-time dependencies")
+        # Separately, and pyctcdecode FIRST: it is pure python and always installs, and a single
+        # combined pip command aborts both when the kenlm wheel fails.
+        subprocess.run(f'"{sys.executable}" -m pip install -q pyctcdecode', shell=True, check=False)
+        install_scorer(a.work)
 
     print("\ncollecting transcripts")
     held = {norm(t) for s in ("validation", "test") for t in texts(a.repo, s)}
