@@ -140,14 +140,26 @@ def build(arch: D.Arch, n_vocab: int, head_hidden: int, device, dtype, clamp_dty
     return tower.to(device), head.to(device).float()
 
 
-def set_trainable(tower, unfreeze_top: int) -> int:
+def set_trainable(tower, unfreeze_top: int, unfreeze_all: bool = False) -> int:
+    """`--unfreeze-top N` trains only the last N Conformer blocks. Note what that LEAVES frozen:
+    `subsample_conv_projection` (the conv frontend that turns 128-bin mels into frames) and
+    `output_proj`. For ASR the frontend is exactly where a general-purpose audio encoder most
+    needs to adapt, so `--unfreeze-all` exists to train the whole tower."""
     for p in tower.parameters():
-        p.requires_grad = False
-    if unfreeze_top > 0:
+        p.requires_grad = bool(unfreeze_all)
+    if not unfreeze_all and unfreeze_top > 0:
         for layer in list(tower.layers)[-unfreeze_top:]:
             for p in layer.parameters():
                 p.requires_grad = True
-    return sum(p.numel() for p in tower.parameters() if p.requires_grad)
+    trainable = sum(p.numel() for p in tower.parameters() if p.requires_grad)
+    if not unfreeze_all and unfreeze_top >= len(tower.layers):
+        frozen = sum(p.numel() for n, p in tower.named_parameters()
+                     if not p.requires_grad and not n.startswith("layers."))
+        if frozen:
+            print(f"  note: every Conformer block is unfrozen, but {frozen/1e6:.1f}M params "
+                  f"outside them (conv frontend, output_proj) stay frozen. "
+                  f"Use --unfreeze-all to train those too.")
+    return trainable
 
 
 def encode(tower, batch, arch, device, amp_dtype):
@@ -230,6 +242,9 @@ def main() -> None:
     ap.add_argument("--subset", type=int, default=0, help="stop after N rows (smoke tests)")
     ap.add_argument("--freeze-encoder", action="store_true")
     ap.add_argument("--unfreeze-top", type=int, default=0)
+    ap.add_argument("--unfreeze-all", action="store_true",
+                    help="train the WHOLE tower, including the conv frontend and output_proj "
+                         "that --unfreeze-top never reaches")
     ap.add_argument("--head-hidden", type=int, default=0)
     ap.add_argument("--amp", default="fp16", choices=["fp16", "bf16", "off"])
     ap.add_argument("--clip", type=float, default=5.0)
@@ -253,7 +268,7 @@ def main() -> None:
     # unscale FP16 gradients"), so anything we actually train must be stored fp32 and reach fp16
     # only through autocast. With the encoder frozen it has no gradients, so fp16 weights are fine
     # there and halve its memory.
-    train_encoder = (not args.freeze_encoder) and args.unfreeze_top > 0
+    train_encoder = (not args.freeze_encoder) and (args.unfreeze_top > 0 or args.unfreeze_all)
     if device.type == "cpu" or train_encoder:
         load_dtype = torch.float32
     else:
@@ -265,7 +280,8 @@ def main() -> None:
           f"enc_dim={arch.encoder_dim} enc_fps={arch.fps}")
     tower, head = build(arch, len(vocab), args.head_hidden, device, load_dtype,
                         clamp_dtype=amp_dtype or load_dtype)
-    n_unfrozen = set_trainable(tower, 0 if args.freeze_encoder else args.unfreeze_top)
+    n_unfrozen = set_trainable(tower, 0 if args.freeze_encoder else args.unfreeze_top,
+                               unfreeze_all=args.unfreeze_all and not args.freeze_encoder)
     print(f"trainable: head {sum(p.numel() for p in head.parameters())/1e6:.2f}M "
           f"+ encoder {n_unfrozen/1e6:.2f}M")
 
